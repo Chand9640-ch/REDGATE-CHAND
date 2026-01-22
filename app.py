@@ -38,7 +38,6 @@ load_dotenv("ATT92742.env")
 # Note: startup no longer creates/initializes any local DB files or config entries.
 # Configuration is read from environment variables first; if sample.db exists, we may read from it (read-only).
 
-
 def get_config_value(key: str) -> str | None:
     """
     Read configuration value from environment first.
@@ -172,7 +171,6 @@ def connect_to_database(db_name: str):
         return connect_to_server()
 
     raise RuntimeError("SQLite DB not found and DB_MODE is not mssql.")
-
  
 # ─── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -269,57 +267,86 @@ def get_columns_endpoint():
 
 def extract_count_column(prompt: str, source_col):
     """
-    Smarter detection of count column from free text.
-    Supports:
-    - count firstname
-    - count first name
-    - count of firstname
-    - distinct count firstname
-    - count FirstName
-    Returns: (column_name or None, is_distinct_flag)
+    Detects count column and DISTINCT intent from free text.
+
+    Special rules:
+    - NULL checks ALWAYS return (None, False) → COUNT(*)
+    - DISTINCT handled only when explicitly requested
     """
-    lower_prompt = prompt.lower().replace("(", " ").replace(")", " ").replace(",", " ")
 
-    # schema columns (lowercase)
+    lower_prompt = (
+        prompt.lower()
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace(",", " ")
+    )
+
     colnames = [c["name"].lower() for c in source_col]
-
-    # DISTINCT detection
-    is_distinct = "distinct" in lower_prompt
-
-    # Tokenize
     tokens = lower_prompt.split()
 
-    # 1️⃣ Pattern: "count firstname"
+    # -------------------------------------------------
+    # 1️⃣ NULL CHECK DETECTION → FORCE COUNT(*)
+    # -------------------------------------------------
+    null_keywords = {"null", "is null", "missing", "blank", "empty"}
+
+    if any(k in lower_prompt for k in null_keywords):
+        # Never count a column for NULL checks
+        return None, False
+
+    # -------------------------------------------------
+    # 2️⃣ DISTINCT DETECTION
+    # -------------------------------------------------
+    is_distinct = "distinct" in tokens
+
+    # -------------------------------------------------
+    # 3️⃣ Explicit patterns: "count <column>"
+    # -------------------------------------------------
     if "count" in tokens:
         idx = tokens.index("count")
-        lookahead = tokens[idx + 1 : idx + 4]  # 3-word lookahead
+        lookahead = tokens[idx + 1 : idx + 4]
 
-        # Try join like "first" + "name"
         joined_variants = []
         for i in range(len(lookahead)):
             for j in range(i + 1, len(lookahead)):
                 joined_variants.append(lookahead[i] + lookahead[j])
                 joined_variants.append(lookahead[i] + "_" + lookahead[j])
 
-        # Direct + joined check
         for token in lookahead + joined_variants:
-            for col in colnames:
-                if token == col:
-                    return col, is_distinct
+            if token in colnames:
+                return token, is_distinct
 
-    # 2️⃣ Pattern: "count of <column>"
+    # -------------------------------------------------
+    # 4️⃣ Pattern: "count of <column>"
+    # -------------------------------------------------
     for col in colnames:
         if f"count of {col}" in lower_prompt:
             return col, is_distinct
 
-    # 3️⃣ Fuzzy match
-    for col in colnames:
-        if col in lower_prompt:
-            return col, is_distinct
-
-    # Default
+    # -------------------------------------------------
+    # 5️⃣ NO COLUMN FOUND → COUNT(*)
+    # -------------------------------------------------
     return None, is_distinct
 
+def extract_compound_columns(prompt: str, source_col):
+    """
+    Extract multiple columns for compound unique checks.
+    Example prompts:
+      - check unique combination of email and hire_date
+      - ensure email, hire_date is unique
+      - compound unique email hire_date
+    """
+    lower_prompt = prompt.lower().replace(",", " ").replace("(", " ").replace(")", " ")
+    tokens = lower_prompt.split()
+
+    colnames = {c["name"].lower(): c["name"] for c in source_col}
+
+    found = []
+    for token in tokens:
+        if token in colnames and token not in found:
+            found.append(colnames[token])
+
+    # Compound unique requires 2+ columns
+    return found if len(found) >= 2 else []
 
 # ------------------------------------------------------------
 #   SQL SANITIZER – Removes invalid datatype comparisons
@@ -381,77 +408,108 @@ def sanitize_sql(sql: str, source_col):
 
     return before_where + "WHERE " + " OR ".join(safe_conditions) + ";"
 
-
 # ------------------------------------------------------------
 #   MAIN QUERY BUILDER
 # ------------------------------------------------------------
 def generate_where_clause(prompt: str, source_db: str, source_table: str, source_col):
     """
     Generates SQL:
-        SELECT COUNT(*) OR COUNT(column)
-        + type-safe WHERE clause
+      - COUNT(*) / COUNT(col) / COUNT(DISTINCT col)
+      - WHERE clause for ALL supported DQ checks
     """
     try:
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return f"SELECT COUNT(*) AS row_count FROM {source_db}.{source_table} WHERE 1=1;"
-
         openai.api_key = api_key
 
-        # -------- COUNT COLUMN -------- #
+        # ---------- COUNT COLUMN ----------
         count_col, is_distinct = extract_count_column(prompt, source_col)
 
         if count_col:
-            count_expr = f"COUNT(DISTINCT {count_col}) AS row_count" if is_distinct else f"COUNT({count_col}) AS row_count"
+            count_expr = (
+                f"COUNT(DISTINCT {count_col}) AS row_count"
+                if is_distinct else
+                f"COUNT({count_col}) AS row_count"
+            )
         else:
             count_expr = "COUNT(*) AS row_count"
 
-        # -------- GPT WHERE BUILDER -------- #
-        system_prompt = "You are an expert SQL assistant. You return ONLY SQL."
+        # -------------------------------------------------
+        # 1️⃣ COMPOUND UNIQUE CHECK (SQL SERVER SAFE)
+        # -------------------------------------------------
+        compound_cols = extract_compound_columns(prompt, source_col)
+
+        if compound_cols:
+            group_cols = ", ".join(compound_cols)
+            join_conditions = " AND ".join(
+                [f"t.{c} = d.{c}" for c in compound_cols]
+            )
+
+            return f"""
+            SELECT COUNT(*) AS row_count
+            FROM {source_db}.{source_table} t
+            JOIN (
+                SELECT {group_cols}
+                FROM {source_db}.{source_table}
+                GROUP BY {group_cols}
+                HAVING COUNT(*) > 1
+            ) d
+            ON {join_conditions};
+            """
+
+        # ---------- GPT PROMPT (FIXED) ----------
+        system_prompt = (
+            "You are an expert SQL data quality assistant. "
+            "You ALWAYS generate a WHERE clause when the user provides any condition."
+        )
 
         user_prompt = f"""
-        Build this query:
+Generate ONE valid SQL query.
 
-        SELECT {count_expr}
-        FROM {source_db}.{source_table}
+BASE QUERY:
+SELECT {count_expr}
+FROM {source_db}.{source_table}
 
-        WHERE must be added **only if the prompt contains a valid, type-safe condition**.
-        Otherwise use:
-            WHERE 1=1
+SUPPORTED CHECKS (ALWAYS APPLY WHEN IMPLIED):
+- Null check → column IS NULL
+- Range check → BETWEEN
+- Validity check → IN (...)
+- Format check → LIKE
+- Default check → column = value
+- Custom filter → exact SQL condition
+- Unique checks → COUNT(DISTINCT ...)
 
-        SCHEMA:
-        {chr(10).join([f"- {c['name']}: {c['type']}" for c in source_col])}
+SCHEMA (ONLY USE THESE COLUMNS):
+{chr(10).join([f"- {c['name']} ({c['type']})" for c in source_col])}
 
-        RULES:
-        - Only SQL output, ending with semicolon
-        - Never compare wrong datatypes
-        - Strings use LOWER()
-        - LIKE supported
-        - OR groups must be in parentheses
+RULES:
+- Output ONLY SQL
+- End with semicolon
+- Never hallucinate columns
+- Strings → LOWER()
+- IN values → lowercase
+- If unclear → WHERE 1=1
 
-        USER PROMPT:
-        "{prompt}"
-        """
+USER CONDITION:
+{prompt}
+"""
 
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             temperature=0,
-            max_tokens=200,
+            max_tokens=250
         )
 
         sql_out = response.choices[0].message.content.strip()
 
-        # ---- FIX MARKDOWN FENCES ----
+        # ---------- CLEANUP ----------
         sql_out = sql_out.replace("```sql", "").replace("```", "").strip()
-
-        # Remove accidental "source." or "target."
         sql_out = re.sub(r"\b(source|target)\.", "", sql_out, flags=re.IGNORECASE)
 
-        # Sanitize unsafe conditions
+        # ---------- SAFETY ----------
         sql_out = sanitize_sql(sql_out, source_col)
 
         return sql_out
@@ -540,7 +598,8 @@ def validate():
     try:
         data = request.get_json()
 
-        required = ["source_db", "target_db", "source_table", "target_table", "prompt"]
+        # ------------------ REQUIRED FIELDS ------------------
+        required = ["source_db", "target_db", "prompt", "mappings"]
         for f in required:
             if not data.get(f):
                 return jsonify({"error": f"Missing field: {f}"}), 400
@@ -548,41 +607,76 @@ def validate():
         source_db = data["source_db"]
         target_db = data["target_db"]
         prompt    = data["prompt"]
+        mappings  = data["mappings"]
 
-        # Convert to list (support single or multi)
-        source_tables = data["source_table"]
-        target_tables = data["target_table"]
-
-        if not isinstance(source_tables, list):
-            source_tables = [source_tables]
-
-        if not isinstance(target_tables, list):
-            target_tables = [target_tables]
-
-        if len(source_tables) != len(target_tables):
-            return jsonify({"error":"Source & Target table counts mismatch"}), 400
+        if not isinstance(mappings, list) or len(mappings) == 0:
+            return jsonify({"error": "No table mappings provided"}), 400
 
         results = []
 
-        for s_table, t_table in zip(source_tables, target_tables):
+        # ------------------ CONNECT ONCE (IMPORTANT) ------------------
+        src_engine = connect_to_database(source_db)
+        tgt_engine = connect_to_database(target_db)
+
+        src_inspect = inspect(src_engine)
+        tgt_inspect = inspect(tgt_engine)
+
+        # ------------------ PROCESS EACH MAPPING ------------------
+        for idx, mapping in enumerate(mappings, start=1):
+
+            s_table = mapping.get("source_table")
+            t_table = mapping.get("target_table")
+
+            if not s_table or not t_table:
+                return jsonify({
+                    "error": f"Invalid mapping at index {idx}"
+                }), 400
+
+            # ---- Split schema.table ----
             s_schema, s_name = split_schema_table(s_table)
             t_schema, t_name = split_schema_table(t_table)
 
-            # SOURCE
-            src_engine = connect_to_database(source_db)
-            src_inspect = inspect(src_engine)
-            src_cols = src_inspect.get_columns(s_name, schema=s_schema)
-            src_query = generate_where_clause(prompt, source_db, s_table, src_cols)
+            # ------------------ SOURCE ------------------
+            try:
+                src_cols = src_inspect.get_columns(s_name, schema=s_schema)
+            except Exception:
+                return jsonify({
+                    "error": f"Source table '{s_table}' not found in database '{source_db}'"
+                }), 400
+
+            src_query = generate_where_clause(
+                prompt=prompt,
+                source_db=source_db,
+                source_table=s_table,
+                source_col=src_cols
+            )
+
             src_count = get_row_count(src_engine, s_name, src_query)
 
-            # TARGET
-            tgt_engine = connect_to_database(target_db)
-            tgt_inspect = inspect(tgt_engine)
-            tgt_cols = tgt_inspect.get_columns(t_name, schema=t_schema)
-            tgt_query = generate_where_clause(prompt, target_db, t_table, tgt_cols)
+            # ------------------ TARGET ------------------
+            try:
+                tgt_cols = tgt_inspect.get_columns(t_name, schema=t_schema)
+            except Exception:
+                return jsonify({
+                    "error": f"Target table '{t_table}' not found in database '{target_db}'"
+                }), 400
+
+            tgt_query = generate_where_clause(
+                prompt=prompt,
+                source_db=target_db,
+                source_table=t_table,
+                source_col=tgt_cols
+            )
+
             tgt_count = get_row_count(tgt_engine, t_name, tgt_query)
 
-            summary = generate_summary(src_count, tgt_count, src_query, tgt_query)
+            # ------------------ SUMMARY ------------------
+            summary = generate_summary(
+                source_count=src_count,
+                target_count=tgt_count,
+                source_query=src_query,
+                target_query=tgt_query
+            )
 
             results.append({
                 "source_table": s_table,
