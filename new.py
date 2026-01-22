@@ -12,6 +12,7 @@ from flask_cors import CORS
 from sqlalchemy import create_engine, inspect, text
 from urllib3.exceptions import InsecureRequestWarning
 import openai
+import json
 import re 
 from dotenv import load_dotenv
 
@@ -37,7 +38,6 @@ load_dotenv("ATT92742.env")
 
 # Note: startup no longer creates/initializes any local DB files or config entries.
 # Configuration is read from environment variables first; if sample.db exists, we may read from it (read-only).
-
 
 def get_config_value(key: str) -> str | None:
     """
@@ -172,7 +172,6 @@ def connect_to_database(db_name: str):
         return connect_to_server()
 
     raise RuntimeError("SQLite DB not found and DB_MODE is not mssql.")
-
  
 # ─── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -267,240 +266,347 @@ def get_columns_endpoint():
         logger.error(f"Error fetching columns: {e}")
         return jsonify({"error": str(e)}), 500
 
-def generate_where_clause(
-    prompt: str,
-    source_db: str,
-    source_table: str,
-    source_col
-    
-) -> str:
+app = Flask(__name__, template_folder="templates", static_folder="static")
+CORS(app)
+
+# ─── UTILITIES ─────────────────────────────────────────────────────
+
+def extract_table_roles(prompt):
+    text = " ".join(prompt.splitlines())
+
+    src = re.search(r"source\s+table\s+([a-zA-Z_]+\.[a-zA-Z_]+)", text, re.IGNORECASE)
+    tgt = re.search(r"target\s+table\s+([a-zA-Z_]+\.[a-zA-Z_]+)", text, re.IGNORECASE)
+
+    return (
+        src.group(1) if src else None,
+        tgt.group(1) if tgt else None
+    )
+
+def split_prompt_into_jobs(prompt):
+    parts = re.split(r"\n\s*\d+\)", prompt)
+    return [p.strip() for p in parts if p.strip()]
+
+SQL_KEYWORDS = {
+    "and","or","not","is","null","like","in","between",
+    "exists","select","where","from","on","join","inner","left","right"
+}
+
+def extract_columns_from_sql(expr):
+    tokens = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', expr)
+    return [t for t in tokens if t.lower() not in SQL_KEYWORDS]
+
+def validate_columns_exist(rule, columns, table):
+    colset = {c["name"].lower() for c in columns}
+
+    for c in rule["checks"]:
+        if c.get("column"):
+            if c["column"].lower() not in colset:
+                raise ValueError(f"❌ Column '{c['column']}' does not exist in {table}")
+
+        for col in c.get("columns", []):
+            if col.lower() not in colset:
+                raise ValueError(f"❌ Column '{col}' does not exist in {table}")
+
+        if c["type"] == "custom":
+            for col in extract_columns_from_sql(c["sql"]):
+                if col.lower() not in colset:
+                    raise ValueError(f"❌ Column '{col}' does not exist in {table}")
+
+def split_rules_by_table(prompt, tables):
+    rules = {t: [] for t in tables}
+    parts = re.split(r"[.;\n]", prompt)
+
+    for part in parts:
+        for t in tables:
+            if t.lower() in part.lower():
+                rules[t].append(part.strip())
+
+    return {k: " ".join(v) for k, v in rules.items() if v}
+
+def get_foreign_keys(engine, schema, table):
+    q = f"""
+    SELECT
+        OBJECT_NAME(fkc.parent_object_id) AS parent_table,
+        COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS parent_column,
+        OBJECT_NAME(fkc.referenced_object_id) AS referenced_table,
+        COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) AS referenced_column
+    FROM sys.foreign_key_columns fkc
+    WHERE OBJECT_SCHEMA_NAME(fkc.parent_object_id) = '{schema}'
+      AND OBJECT_NAME(fkc.parent_object_id) = '{table}';
     """
-    Generate a dynamic, type-safe SQL WHERE clause.
-    Handles:
-    - 'any column' with type-safe IN clauses
-    - BETWEEN conditions
-    - String/date vs numeric type handling
-    - GPT fallback for complex free-form conditions
-    """
+    with engine.connect() as c:
+        return pd.read_sql(q, c).to_dict("records")
 
-    try:
-        # -------- GPT fallback for complex prompts -------- #
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            logger.debug("OPENAI_API_KEY not found. Using fallback WHERE 1=1.")
-            return "WHERE 1=1"
+def extract_joins(prompt, foreign_keys):
+    joins = []
+    m = re.search(r"join\s+with\s+([a-zA-Z_]+\.[a-zA-Z_]+)", prompt, re.IGNORECASE)
+    if not m:
+        return joins
 
-        openai.api_key = api_key
+    join_table = m.group(1)
+    join_name = join_table.split(".")[1].lower()
 
-        system_prompt = "You are an expert SQL assistant."
-        
-        user_prompt = f"""
-        Generate ONLY a valid SQL query (no explanation, no code fences, no extra text) that returns the row count for the specified table.
-        - The query MUST start with: SELECT COUNT(*) AS row_count FROM {source_db}.{source_table}
-        - If a filtering condition can be inferred from the user's natural-language condition, include a WHERE clause. If the condition is ambiguous or cannot be interpreted, use: WHERE 1=1
-        - Use these inputs only: source_db: {source_db}, source_table: {source_table}, source_columns: {', '.join([col['name'] for col in source_col])}
-        - If the user says "any column" (or similar), match across ALL source_columns joined with OR and wrapped in parentheses.
-        - Do NOT reference columns not present in source_columns; ignore unknown column names.
-        - Translate common NL patterns:
-        - "between A and B" → `col BETWEEN A AND B`
-        - comma-separated lists or "in (a, b, c)" → `col IN (v1, v2, ...)`
-        - "starts with X" → `col LIKE 'X%'`
-        - "ends with X" → `col LIKE '%X'`
-        - "contains X" → `col LIKE '%X%'`
-        - "is null" / "is not null" → `col IS NULL` / `col IS NOT NULL`
-        - comparisons (>, <, >=, <=, =, !=) → use standard SQL operators
-        - Literals:
-        - Wrap string and date values in single quotes, escaping single quotes by doubling them.
-        - Do NOT quote numeric or boolean literals.
-        - Assume common date format YYYY-MM-DD if ambiguous; wrap in quotes.
-        - Case-insensitive requests: use LOWER(column) and lower the literal (e.g., `LOWER(col) LIKE '%x%'`).
-        - When combining OR conditions, group them with parentheses: `(colA = 'x' OR colB = 'x')`.
-        - Output should be a properly formatted multi-line SQL statement (line breaks allowed) and end with a single semicolon.
-        - Do NOT include any comments, hints, or metadata—only the SQL statement.
+    for fk in foreign_keys:
+        if fk["referenced_table"].lower() == join_name:
+            joins.append({
+                "table": join_table,
+                "on": f"t.{fk['parent_column']} = j.{fk['referenced_column']}",
+                "type": "INNER"
+            })
 
-        Examples:
-        User: "status = active and created between 2023-01-01 and 2023-03-31"
-        →
-        SELECT COUNT(*) AS row_count
-        FROM {source_db}.{source_table}
-        WHERE status = 'active' AND created BETWEEN '2023-01-01' AND '2023-03-31';
+    return joins
 
-        User: "any column contains foo and id in (1,2,3)"
-        →
-        SELECT COUNT(*) AS row_count
-        FROM {source_db}.{source_table}
-        WHERE (col1 LIKE '%foo%' OR col2 LIKE '%foo%' OR col3 LIKE '%foo%') AND id IN (1,2,3);
+# ─── GPT → DQ RULE ─────────────────────────────────────────────────
 
-        Now produce the SQL query for this user condition:
-        "{prompt}"
-        """
+def parse_dq_rule(prompt, columns, foreign_keys, table):
+    col_list = ", ".join([c["name"] for c in columns])
 
+    fk_text = "\n".join(
+        f"{f['parent_table']}.{f['parent_column']} = {f['referenced_table']}.{f['referenced_column']}"
+        for f in foreign_keys
+    ) or "None"
 
+    gpt_prompt = f"""
+You are a Data Quality rule parser.
 
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0,
-            max_tokens=200
-        )
-        wc = response.choices[0].message.content.strip()
-        # if not wc.lower().startswith("where"):
-        #     wc = f"WHERE {wc}"
+Table: {table}
 
-        # Remove unsupported table prefixes
-        wc = re.sub(r'\b(source|target)\.', '', wc, flags=re.IGNORECASE)
-        print("Generated Query:", wc)
-        return wc
+Known relationships:
+{fk_text}
 
-    except Exception as e:
-        print(f"generate_where_clause error: {e}")
-        return "WHERE 1=1"
+Available columns:
+{col_list}
 
-def get_row_count(engine, table_name, where_clause):
-    """
-    Use DB-specific quoting for table name:
-      - mssql : [table]
-      - sqlite: "table"
-    """
-    mode = get_db_mode()
-    _safe_identifier(table_name)
-    if mode == "mssql":
-        q = where_clause
-    else:
-        q = where_clause
-    with engine.connect() as conn:
-        result = conn.execute(text(q))
-        val = result.scalar()
-        return int(val or 0)
+User rule:
+{prompt}
 
-def generate_simple_summary(source_count, target_count, is_anomaly):
-    if source_count == target_count:
-        return f"Perfect match: both have {source_count} rows."
-    diff = abs(source_count - target_count)
-    pct = (diff / max(source_count, target_count)) * 100 if max(source_count, target_count) else 0
-    status = "significant discrepancy" if pct > 5 else "minor difference"
-    anomaly = " Possible anomaly." if is_anomaly else ""
-    return f"Row count mismatch: {diff} rows difference ({pct:.1f}% {status}).{anomaly}"
+Convert to JSON:
 
+{{
+ "checks":[
+  {{
+   "type":"row_count|null_check|unique|compound_unique|range|default|format|validity|custom",
+   "row_count" supports optional filter on column,
+   "column":"column or null",
+   "columns":["c1","c2"],
+   "operator":"=|between|in|like|regex",
+   "value":null|string|number|[v1,v2],
+  }}
+ ],
+ "joins":[
+  {{
+   "table":"schema.table",
+   "on":"t.col = j.col",
+   "type":"INNER|LEFT"
+  }}
+ ]
+}}
 
-def generate_summary(source_count, target_count, source_query,target_query):
-    """
-    Uses OpenAI GPT-4o-mini to generate a data quality summary.
-    Falls back to generate_simple_summary if API key not set or error occurs.
-    """
-    try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            logger.debug("OPENAI_API_KEY not found. Using fallback summary.")
-            return generate_simple_summary(source_count, target_count)
+Rules:
+- Use ONLY available columns
+- format → value must be LIKE pattern (example: '____-__-__')
+- SQL must detect invalid rows
+- If user says "is", "equals", "=", treat as operator "="
+- Do NOT include SELECT or WHERE in custom.sql
 
-        openai.api_key = api_key
+Return ONLY JSON
+"""
 
-        system_prompt = "You are a data quality analyst. Write clear, concise summaries for data engineering reports."
-        user_prompt = f"""
-        Analyze the following row count validation details and write a clear 4–5 sentence summary for a data engineering report:
+    r = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": gpt_prompt}],
+        temperature=0
+    )
 
-        - Source Row Count: {source_count}
-        - Target Row Count: {target_count}
-        - Filter Applied (Source Query): {source_query}
-        - Filter Applied (target Query): {target_query}
-        """
+    raw = r.choices[0].message.content
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    return json.loads(match.group())
 
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0,
-            max_tokens=250
-        )
+# ─── SQL BUILDER ──────────────────────────────────────────────────
 
-        summary = response.choices[0].message.content.strip()
-        return summary
+def get_non_datetime_columns(columns):
+    return [
+        c["name"]
+        for c in columns
+        if "date" not in str(c["type"]).lower()
+    ]
 
-    except Exception as e:
-        logger.error(f"OpenAI GPT summary error: {e}")
-        return generate_simple_summary(source_count, target_count)
+def extract_columns_from_sql(expr):
+    tokens = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', expr)
+    keywords = {"and","or","not","is","null","like","in","between"}
+    return [t for t in tokens if t.lower() not in keywords]
 
-def split_schema_table(full_table_name):
-    if '.' in full_table_name:
-        parts = full_table_name.split('.', 1)
-        return parts[0], parts[1]  # schema, table
-    else:
-        return 'dbo', full_table_name
+def prefix_columns(expr):
+    return re.sub(
+        r'(?<![a-zA-Z0-9_\.])([a-zA-Z_][a-zA-Z0-9_]*)(?!\s*\.)',
+        r't.\1',
+        expr
+    )
 
-# ─── VALIDATE ENDPOINT ─────────────────────────────────────────────────────────
+def build_base(db, table, joins):
+    sql = f" FROM {db}.{table} t "
+    for j in joins:
+        sql += f" {j['type']} JOIN {db}.{j['table']} j ON {j['on']} "
+    return sql
+
+def build_dq_sql(db, table, rule):
+    base = build_base(db, table, rule.get("joins", []))
+    sqls = []
+
+    for c in rule["checks"]:
+
+        if c["type"] == "row_count":
+            if c.get("column"):
+                sqls.append(
+                    f"SELECT COUNT(*) {base} WHERE t.{c['column']} {c.get('operator', '=')} {c['value']}"
+                )
+            else:
+                sqls.append(f"SELECT COUNT(*) {base}")
+
+        elif c["type"] == "null_check":
+            sqls.append(f"SELECT COUNT(*) {base} WHERE t.{c['column']} IS NULL")
+
+        elif c["type"] == "range":
+            sqls.append(f"SELECT COUNT(*) {base} WHERE t.{c['column']} BETWEEN {c['value'][0]} AND {c['value'][1]}")
+
+        elif c["type"] == "default":
+            sqls.append(f"SELECT COUNT(*) {base} WHERE t.{c['column']} = {c['value']}")
+
+        elif c["type"] == "format":
+            op = c.get("operator", "LIKE")
+            sqls.append(
+                f"SELECT COUNT(*) {base} WHERE t.{c['column']} {op} '{c['value']}'"
+            )
+
+        elif c["type"] == "validity":
+            vals = ",".join(f"'{v}'" for v in c["value"])
+            op = c.get("operator", "IN").upper()
+            if op == "IN":
+                sqls.append(f"SELECT COUNT(*) {base} WHERE t.{c['column']} NOT IN ({vals})")
+            else:
+                sqls.append(f"SELECT COUNT(*) {base} WHERE t.{c['column']} IN ({vals})")
+
+        elif c["type"] == "row_count" and c.get("column"):
+            sqls.append(f"SELECT COUNT(*) {base} WHERE t.{c['column']} = {c['value']}")       
+
+        elif c["type"] == "unique":
+            sqls.append(f"""
+            SELECT COUNT(DISTINCT t.{c['column']})
+            FROM {db}.{table} t
+            """)
+
+        elif c["type"] == "compound_unique":
+            cols = ",".join(f"t.{col}" for col in c["columns"])
+            sqls.append(f"""
+            SELECT COUNT(*) FROM (
+                SELECT {cols}, COUNT(*) c
+                FROM {db}.{table} t
+                GROUP BY {cols}
+                HAVING COUNT(*) > 1
+            ) x
+            """)
+
+        elif c["type"] == "custom":
+            raw = prefix_columns(c["sql"])
+            sqls.append(f"SELECT COUNT(*) FROM {db}.{table} t WHERE {raw}")
+
+    return sqls
+
+def run_sql(engine, sqls):
+    with engine.connect() as c:
+        return [int(c.execute(text(q)).scalar() or 0) for q in sqls]
+
+# ─── ROUTES ───────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/api/databases", methods=["GET"])
+def get_databases():
+    engine = connect_to_database("master")
+    df = pd.read_sql("SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0", engine)
+    return jsonify(df["name"].tolist())
+
+@app.route("/api/tables", methods=["POST"])
+def get_tables():
+    db = request.get_json()["database"]
+    engine = connect_to_database(db)
+    insp = inspect(engine)
+
+    tables = []
+    for schema in insp.get_schema_names():
+        for t in insp.get_table_names(schema=schema):
+            tables.append(f"{schema}.{t}")
+    return jsonify(tables)
+
 @app.route("/api/validate", methods=["POST"])
 def validate():
     try:
         data = request.get_json()
-        for field in ['source_db', 'target_db', 'source_table', 'target_table', 'prompt']:
-            if not data.get(field):
-                return jsonify({"error": f"Missing field: {field}"}), 400
+        source_db = data["source_db"]
+        target_db = data["target_db"]
+        prompt = data["prompt"]
 
-        source_db = data['source_db']
-        target_db = data['target_db']
-        source_table = data['source_table']
-        target_table = data['target_table']
-        prompt = data['prompt']
-
-        # --- Split schema and table ---
-        source_schema, source_table_name = split_schema_table(source_table)
-        target_schema, target_table_name = split_schema_table(target_table)
-
-        # --- Get source columns ---
-        engine = connect_to_server(source_db)
-        inspector = inspect(engine)
-        source_cols = inspector.get_columns(source_table_name, schema=source_schema)
-        Source_SQL_Query = generate_where_clause(prompt, source_db, source_table,source_cols)
-        src_engine = connect_to_database(source_db) 
-        src_count = get_row_count(src_engine, source_table, Source_SQL_Query)
-        print("source values",source_db,source_table, Source_SQL_Query)
-        print("source count",src_count)
-        # --- Get target columns ---
-        engine = connect_to_server(target_db)
-        inspector = inspect(engine)
-        target_cols = inspector.get_columns(target_table_name, schema=target_schema)
-        Target_SQL_Query = generate_where_clause(prompt, target_db, target_table,target_cols)
+        src_engine = connect_to_database(source_db)
         tgt_engine = connect_to_database(target_db)
-        tgt_count = get_row_count(tgt_engine, target_table, Target_SQL_Query)
-        print("target values",target_db,target_table, Target_SQL_Query)
-        print("target count",tgt_count)
 
-        summary = generate_summary(src_count, tgt_count, Source_SQL_Query,Target_SQL_Query)
+        jobs = split_prompt_into_jobs(prompt)
 
-        return jsonify({
-            "source_count": src_count,
-            "target_count": tgt_count,
-            "Source_Query": Source_SQL_Query,
-            "target_Query": Target_SQL_Query,
+        results = []
 
-            "summary": summary
-        })
+        for job in jobs:
+            try:
+                source_table, target_table = extract_table_roles(job)
+                source_table, target_table = extract_table_roles(job)
+                if not source_table or not target_table:
+                    results.append({"error": f"Missing source/target in rule: {job}"})
+                    continue
+
+                s_schema, s_name = source_table.split(".", 1)
+                t_schema, t_name = target_table.split(".", 1)
+
+                # SOURCE
+                src_cols = inspect(src_engine).get_columns(s_name, schema=s_schema)
+                src_fk = get_foreign_keys(src_engine, s_schema, s_name)
+                src_rule = parse_dq_rule(job, src_cols, src_fk, source_table)
+                src_rule["joins"] = extract_joins(job, src_fk)
+                validate_columns_exist(src_rule, src_cols, source_table)
+
+                src_sql = build_dq_sql(source_db, source_table, src_rule)
+                src_vals = run_sql(src_engine, src_sql)
+
+                # TARGET
+                tgt_cols = inspect(tgt_engine).get_columns(t_name, schema=t_schema)
+                tgt_fk = get_foreign_keys(tgt_engine, t_schema, t_name)
+                tgt_rule = parse_dq_rule(job, tgt_cols, tgt_fk, target_table)
+                tgt_rule["joins"] = extract_joins(job, tgt_fk)
+                validate_columns_exist(tgt_rule, tgt_cols, target_table)
+
+                tgt_sql = build_dq_sql(target_db, target_table, tgt_rule)
+                tgt_vals = run_sql(tgt_engine, tgt_sql)
+
+                results.append({
+                    "source_table": source_table,
+                    "target_table": target_table,
+                    "source_count": src_vals[0] if src_vals else 0,
+                    "target_count": tgt_vals[0] if tgt_vals else 0,
+                    "summary": f"Source: {sum(1 for x in src_vals if x>0)}, Target: {sum(1 for x in tgt_vals if x>0)}",
+                    "source_query": ";\n".join(src_sql),
+                    "target_query": ";\n".join(tgt_sql)
+                })
+            except Exception as e:
+                results.append({
+                    "error": str(e),
+                    "rule": job
+                })
+
+        return jsonify({"results": results})
 
     except Exception as e:
         logger.error(traceback.format_exc())
-        return jsonify({"error": f"Validation failed: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 400
 
-
-# ─── ERROR HANDLERS & MAIN ─────────────────────────────────────────────────────
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({"error": "Internal server error"}), 500
-
-
-if __name__ == '__main__':
-    logger.info(f"Starting app in DB_MODE={get_db_mode()}")
-    # Accept DEFAULT_MSSQL_SERVER as valid fallback:
-    if get_db_mode() == "mssql" and not (get_config_value("MSSQL_SERVER") or DEFAULT_MSSQL_SERVER):
-        print("Please set MSSQL_SERVER in environment if you do not want to use the default fallback server.")
-    else:
-        app.run(debug=True, host='0.0.0.0', port=5000)
+# ─── RUN ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
